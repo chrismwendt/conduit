@@ -645,7 +645,7 @@ spec = do
         let block = newEmptyMVar >>= takeMVar :: IO ()
         it "propagates exceptions" $ do
             let go = runConduitRes $ yield (throwM Boom) .| concurrentMap 10 id .| sinkNull
-            go `shouldThrow` (== Boom)
+            go `shouldThrow` (\(ExceptionInLinkedThread _ e) -> fromException e == Just Boom)
         it "rejects invalid concurrency" $ do
             let go = runConduitRes $ yield () .| concurrentMap 0 return .| sinkNull
             go `shouldThrow` (== InvalidConcurrencyLimitException)
@@ -661,7 +661,7 @@ spec = do
                     yield $ takeMVar ready >> throwM Boom
                     yield $ (putMVar ready () >> block) `catchAny` \_ -> putMVar killed ()
             let go = runConduitRes $ source .| concurrentMap 10 id .| sinkNull
-            go `shouldThrow` (== Boom)
+            go `shouldThrow` (\(ExceptionInLinkedThread _ e) -> fromException e == Just Boom)
             takeMVar killed
         it "kills all workers upon an exception in the conduit" $ do
             ready <- newEmptyMVar

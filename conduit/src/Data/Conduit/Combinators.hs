@@ -209,6 +209,7 @@ import qualified Data.ByteString.Builder.Internal as BB (flush)
 import qualified Data.ByteString.Builder.Extra as BB (runBuilder, Next(Done, More, Chunk))
 import qualified Data.NonNull as NonNull
 import qualified Data.Traversable
+import qualified Data.Foldable as Foldable
 import qualified Data.ByteString as S
 import qualified Data.ByteString.Lazy as BL
 import           Data.ByteString.Lazy.Internal (defaultChunkSize)
@@ -217,7 +218,7 @@ import           Control.Exception           (catch, throwIO, finally, bracket, 
 import           Control.Category            (Category (..))
 import qualified Control.Concurrent.Async    as Async
 import           Control.Concurrent.MVar
-import           Control.Monad               (unless, when, (>=>), liftM, forever)
+import           Control.Monad               (unless, when, (=<<), (>=>), liftM, forever)
 import           Control.Monad.IO.Unlift     (MonadIO (..), MonadUnliftIO, withRunInIO)
 import           Control.Monad.Primitive     (PrimMonad, PrimState, unsafePrimToPrim)
 import           Control.Monad.Trans.Class   (lift)
@@ -2589,65 +2590,49 @@ instance Exception InvalidConcurrencyLimitException
 -- positive.
 --
 -- @since 1.3.4.3
-concurrentMap :: (MonadIO m, MonadResource m, MonadThrow m) => Int -> (i -> IO o) -> ConduitT i o m ()
+concurrentMap :: (MonadIO m, MonadResource m) => Int -> (i -> IO o) -> ConduitT i o m ()
 concurrentMap concurrencyLimit process = do
-    unless (concurrencyLimit > 0) (throwM InvalidConcurrencyLimitException)
+    unless (concurrencyLimit > 0) $ liftIO $ throwIO InvalidConcurrencyLimitException
 
-    workersMVar <- liftIO $ newMVar Sequence.empty
+    workersRef <- liftIO $ newIORef Sequence.empty
+
+    let spawn input = liftIO $ uninterruptibleMask $ \restore -> do
+          worker <- Async.async $ restore $ process input
+          modifyIORef' workersRef (Sequence.|> worker)
+          Async.link worker
 
     let yieldCompleted = do
-          workers <- liftIO $ readMVar workersMVar
+          workers <- liftIO $ readIORef workersRef
           case workers of
             Sequence.Empty -> return ()
             (worker Sequence.:<| others) -> do
-              maybeResult <- liftIO (Async.poll worker)
-              case maybeResult of
-                Nothing -> return ()
-                Just result -> do
-                  _ <- liftIO $ swapMVar workersMVar others
-                  case result of
-                    Left e -> throwM e
-                    Right output -> yield output >> yieldCompleted
-
-    let maybeYield = do
-          workers <- liftIO $ readMVar workersMVar
-          case workers of
-            Sequence.Empty -> return False
-            (worker Sequence.:<| rest) -> do
-              result <- liftIO $ Async.waitCatch worker
-              case result of
-                Left e -> throwM e
-                Right output -> do
-                  _ <- liftIO $ swapMVar workersMVar rest
+              if (Sequence.length workers == concurrencyLimit)
+                then do
+                  output <- liftIO $ Async.wait worker
+                  liftIO $ writeIORef workersRef others
                   yield output
-                  return True
+                  yieldCompleted
+                else do
+                  maybeResult <- liftIO $ Async.poll worker
+                  case maybeResult of
+                    Nothing -> return ()
+                    Just result -> do
+                      liftIO $ writeIORef workersRef others
+                      either (liftIO . throwIO) yield result
+                      yieldCompleted
 
-    let yieldWhenFull = do
-          workers <- liftIO $ readMVar workersMVar
-          when (Sequence.length workers == concurrencyLimit) $ do
-            yielded <- maybeYield
-            unless yielded $ throwM InvalidConcurrencyLimitException
+    let yieldRemaining = do
+          workers <- liftIO $ readIORef workersRef
+          Foldable.mapM_ (yieldM . liftIO . Async.wait) workers
 
-    let spawn input = liftIO $ do
-          -- Mask to prevent asynchronous exceptions from interrupting the MVar
-          -- update and leaking the thread.
-          uninterruptibleMask $ \restore -> do
-            modifyMVar_ workersMVar $ \workers -> do
-              worker <- Async.async $ restore $ process input
-              -- 💥 An asynchronous exception here is blocked until after the
-              -- MVar modification completes.
-              return $ workers Sequence.|> worker
-
-    let drain = do
-          yielded <- maybeYield
-          when yielded drain
-
-    let waitForInput = do
-          maybeInput <- await
-          case maybeInput of
-            Just input -> yieldWhenFull >> yieldCompleted >> spawn input >> waitForInput
-            Nothing -> drain
+    let loop = do
+          awaitForever $ \input -> do
+            spawn input
+            yieldCompleted
+          yieldRemaining
 
     let noop = return ()
-    let cancelWorkers _ = readMVar workersMVar >>= Prelude.mapM_ Async.cancel
-    bracketP noop cancelWorkers (\_ -> waitForInput)
+
+    let cancelWorkers _ = Foldable.mapM_ Async.cancel =<< readIORef workersRef
+
+    bracketP noop cancelWorkers (\_ -> loop)
